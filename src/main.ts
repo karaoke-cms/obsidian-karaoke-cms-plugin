@@ -1,14 +1,24 @@
 import { FileSystemAdapter, Notice, Plugin, TFile } from 'obsidian';
 import { DEFAULT_SETTINGS, KaraokeSettingTab, KaraokeSettings } from './settings';
+import { commitAndPush, isGitRepo } from './git';
 
 export default class KaraokePlugin extends Plugin {
 	settings: KaraokeSettings;
 	private statusBarItem: HTMLElement;
 
+	// Push state
+	private isPushing = false;
+	private errorMessage: string | null = null;
+
+	// Stored for retry after push failure
+	private lastPushFile: string | null = null;
+	private lastPushMessage: string | null = null;
+	private lastPushRepoRoot: string | null = null;
+
 	async onload() {
 		await this.loadSettings();
 
-		// Status bar — shows Draft / Published for the active note
+		// Status bar — shows Draft / Published / Pushing... / error
 		this.statusBarItem = this.addStatusBarItem();
 		this.statusBarItem.style.cursor = 'pointer';
 		this.statusBarItem.addEventListener('click', () => this.onStatusBarClick());
@@ -26,6 +36,7 @@ export default class KaraokePlugin extends Plugin {
 		// Update status bar when the current file is saved
 		this.registerEvent(
 			this.app.vault.on('modify', (file) => {
+				if (this.isPushing || this.errorMessage) return;
 				const active = this.app.workspace.getActiveFile();
 				if (active && file.path === active.path) this.refreshStatusBar();
 			})
@@ -53,13 +64,29 @@ export default class KaraokePlugin extends Plugin {
 		});
 
 		this.addSettingTab(new KaraokeSettingTab(this.app, this));
+
+		// Startup: warn if vault is not a git repo
+		const repoRoot = this.getRepoRoot();
+		if (repoRoot) {
+			isGitRepo(repoRoot).then(hasGit => {
+				if (!hasGit) {
+					new Notice(
+						'karaoke-cms: This vault is not a git repository. ' +
+						'Run `npm create @karaoke-cms@latest` to set up your site.',
+						10000
+					);
+				}
+			});
+		} else {
+			new Notice('karaoke-cms: Only works with a local vault on desktop.', 8000);
+		}
 	}
 
 	onunload() {}
 
 	// ── Helpers ────────────────────────────────────────────────────────────────
 
-	getRepoRoot(): string | null {
+	private getRepoRoot(): string | null {
 		const adapter = this.app.vault.adapter;
 		if (adapter instanceof FileSystemAdapter) return adapter.basePath;
 		return null;
@@ -72,51 +99,128 @@ export default class KaraokePlugin extends Plugin {
 
 	// ── Status bar ─────────────────────────────────────────────────────────────
 
-	/** Override in subclass or after git wiring to show pushing / error states. */
-	protected getStatusText(file: TFile): Promise<string> {
-		return this.app.vault.read(file).then(content =>
-			readPublishField(content) ? '✓ Published' : '· Draft'
-		);
-	}
-
+	/**
+	 * Refresh the status bar text based on current push state.
+	 *
+	 * State machine:
+	 *   isPushing          → ⏳ Publishing...
+	 *   errorMessage set   → ⚠ Push failed: {reason}   (click to dismiss)
+	 *   no active note     → (empty)
+	 *   else               → async read frontmatter → ✓ Published | · Draft
+	 */
 	refreshStatusBar(): void {
+		if (this.isPushing) {
+			this.statusBarItem.setText('⏳ Publishing...');
+			return;
+		}
+
+		if (this.errorMessage) {
+			this.statusBarItem.setText(`⚠ Push failed: ${this.errorMessage}`);
+			this.statusBarItem.setAttribute('title', 'Click to dismiss');
+			return;
+		}
+
 		const file = this.getActiveMarkdownFile();
 		if (!file) {
 			this.statusBarItem.setText('');
 			return;
 		}
-		this.getStatusText(file).then(text => {
-			// Guard: file may have changed during the async read
-			if (this.getActiveMarkdownFile()?.path === file.path) {
-				this.statusBarItem.setText(text);
-			}
+
+		const snapshotPath = file.path;
+		this.app.vault.read(file).then(content => {
+			// Guard: active file may have changed during the async read
+			if (this.isPushing || this.errorMessage) return;
+			if (this.getActiveMarkdownFile()?.path !== snapshotPath) return;
+			this.statusBarItem.setText(readPublishField(content) ? '✓ Published' : '· Draft');
+			this.statusBarItem.setAttribute('title', '');
 		});
 	}
 
-	protected onStatusBarClick(): void {
-		// Overridden after git wiring to dismiss error state
+	private onStatusBarClick(): void {
+		if (this.errorMessage) {
+			this.errorMessage = null;
+			this.refreshStatusBar();
+		}
 	}
 
 	// ── Publish toggle ─────────────────────────────────────────────────────────
 
 	async togglePublish(): Promise<void> {
+		if (this.isPushing) return;
+
 		const file = this.getActiveMarkdownFile();
 		if (!file) {
 			new Notice('karaoke-cms: Open a Markdown note to publish.');
 			return;
 		}
 
+		const repoRoot = this.getRepoRoot();
+		if (!repoRoot) {
+			new Notice('karaoke-cms: Only works with a local vault on desktop.');
+			return;
+		}
+
+		// Read, toggle, write
 		const content = await this.app.vault.read(file);
 		const { newContent, isNowPublished } = togglePublishFrontmatter(content);
 		await this.app.vault.modify(file, newContent);
 
+		// Build commit message from frontmatter title
+		const title = getTitleFromContent(newContent, file.basename);
 		const action = isNowPublished ? 'Published' : 'Unpublished';
-		new Notice(`karaoke-cms: ${action} (git push not yet wired).`);
+		const message = this.settings.commitTemplate
+			.replace('{title}', title)
+			.replace('{action}', action);
+
+		// Store for potential retry
+		this.lastPushFile = file.path;
+		this.lastPushMessage = message;
+		this.lastPushRepoRoot = repoRoot;
+
+		this.errorMessage = null;
+		this.isPushing = true;
 		this.refreshStatusBar();
+
+		try {
+			await commitAndPush(file.path, message, repoRoot, this.settings);
+			this.isPushing = false;
+			this.refreshStatusBar();
+			new Notice(`karaoke-cms: ${action}. Site is building.`);
+		} catch (err) {
+			this.isPushing = false;
+			this.errorMessage = err instanceof Error ? err.message : String(err);
+			this.refreshStatusBar();
+		}
 	}
 
+	// ── Retry ──────────────────────────────────────────────────────────────────
+
 	async retryPublish(): Promise<void> {
-		new Notice('karaoke-cms: Nothing to retry.');
+		if (this.isPushing) return;
+		if (!this.lastPushFile || !this.lastPushMessage || !this.lastPushRepoRoot) {
+			new Notice('karaoke-cms: Nothing to retry.');
+			return;
+		}
+
+		this.errorMessage = null;
+		this.isPushing = true;
+		this.refreshStatusBar();
+
+		try {
+			await commitAndPush(
+				this.lastPushFile,
+				this.lastPushMessage,
+				this.lastPushRepoRoot,
+				this.settings
+			);
+			this.isPushing = false;
+			this.refreshStatusBar();
+			new Notice('karaoke-cms: Published successfully.');
+		} catch (err) {
+			this.isPushing = false;
+			this.errorMessage = err instanceof Error ? err.message : String(err);
+			this.refreshStatusBar();
+		}
 	}
 
 	// ── Settings ───────────────────────────────────────────────────────────────
