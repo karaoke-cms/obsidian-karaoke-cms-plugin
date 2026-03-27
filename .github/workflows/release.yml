@@ -1,0 +1,44 @@
+# Release workflow — triggered by a version tag push (e.g. git tag 0.1.0 && git push --tags)
+#
+# Builds main.js and creates a GitHub Release with:
+#   - main.js      (compiled plugin)
+#   - manifest.json (version metadata Obsidian reads)
+#
+# To release:
+#   npm run version   (bumps version in manifest.json + versions.json)
+#   git push && git push --tags
+
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            main.js
+            manifest.json

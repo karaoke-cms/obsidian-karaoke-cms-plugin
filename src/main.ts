@@ -88,7 +88,10 @@ export default class KaraokePlugin extends Plugin {
 
 	private getRepoRoot(): string | null {
 		const adapter = this.app.vault.adapter;
-		if (adapter instanceof FileSystemAdapter) return adapter.basePath;
+		// basePath is not in Obsidian's public TypeScript types but is stable on desktop
+		if (adapter instanceof FileSystemAdapter) {
+			return (adapter as unknown as { basePath: string }).basePath;
+		}
 		return null;
 	}
 
@@ -249,7 +252,7 @@ export function readPublishField(content: string): boolean {
 	if (closeIdx === -1) return false;
 	const body = content.slice(4, closeIdx);
 	const match = body.match(/^publish:\s*(.+)$/m);
-	return match !== null && match[1].trim() === 'true';
+	return match !== null && match[1]?.trim() === 'true';
 }
 
 /**
@@ -298,7 +301,7 @@ export function togglePublishFrontmatter(content: string): {
 		};
 	}
 
-	const isCurrentlyPublished = match[2].trim() === 'true';
+	const isCurrentlyPublished = match[2]?.trim() === 'true';
 	const newBody = fmBody.replace(publishRx, `$1${isCurrentlyPublished ? 'false' : 'true'}`);
 
 	return {
@@ -316,5 +319,5 @@ export function getTitleFromContent(content: string, basename: string): string {
 	if (closeIdx === -1) return basename;
 	const body = content.slice(4, closeIdx);
 	const match = body.match(/^title:\s*['"]?(.+?)['"]?\s*$/m);
-	return match ? match[1].trim() : basename;
+	return match ? (match[1]?.trim() ?? basename) : basename;
 }
