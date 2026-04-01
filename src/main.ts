@@ -1,239 +1,80 @@
-import { FileSystemAdapter, Notice, Plugin, TFile } from 'obsidian';
-import { DEFAULT_SETTINGS, KaraokeSettingTab, KaraokeSettings } from './settings';
-import { commitAndPush, isGitRepo } from './git';
+import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
+import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
 
-export default class KaraokePlugin extends Plugin {
-	settings: KaraokeSettings;
-	private statusBarItem: HTMLElement;
+// Remember to rename these classes and interfaces!
 
-	// Push state
-	private isPushing = false;
-	private errorMessage: string | null = null;
-
-	// Stored for retry after push failure
-	private lastPushFile: string | null = null;
-	private lastPushMessage: string | null = null;
-	private lastPushRepoRoot: string | null = null;
+export default class MyPlugin extends Plugin {
+	settings: MyPluginSettings;
 
 	async onload() {
 		await this.loadSettings();
 
-		// Status bar — shows Draft / Published / Pushing... / error
-		this.statusBarItem = this.addStatusBarItem();
-		this.statusBarItem.style.cursor = 'pointer';
-		this.statusBarItem.addEventListener('click', () => this.onStatusBarClick());
-		this.refreshStatusBar();
-
-		// Ribbon icon — toggles publish status and pushes
-		this.addRibbonIcon('send', 'Publish / Unpublish note', () => {
-			void this.togglePublish();
+		// This creates an icon in the left ribbon.
+		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
+			// Called when the user clicks the icon.
+			new Notice('This is a notice!');
 		});
 
-		// Update status bar when the active note changes
-		this.registerEvent(
-			this.app.workspace.on('active-leaf-change', () => this.refreshStatusBar())
-		);
-		// Update status bar when the current file is saved
-		this.registerEvent(
-			this.app.vault.on('modify', (file) => {
-				if (this.isPushing || this.errorMessage) return;
-				const active = this.app.workspace.getActiveFile();
-				if (active && file.path === active.path) this.refreshStatusBar();
-			})
-		);
+		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
+		const statusBarItemEl = this.addStatusBarItem();
+		statusBarItemEl.setText('Status bar text');
 
-		// Command: toggle from command palette
+		// This adds a simple command that can be triggered anywhere
 		this.addCommand({
-			id: 'toggle-publish',
-			name: 'Toggle publish status',
-			checkCallback: (checking) => {
-				const file = this.getActiveMarkdownFile();
-				if (file) {
-					if (!checking) void this.togglePublish();
+			id: 'open-modal-simple',
+			name: 'Open modal (simple)',
+			callback: () => {
+				new SampleModal(this.app).open();
+			}
+		});
+		// This adds an editor command that can perform some operation on the current editor instance
+		this.addCommand({
+			id: 'replace-selected',
+			name: 'Replace selected content',
+			editorCallback: (editor: Editor, view: MarkdownView) => {
+				editor.replaceSelection('Sample editor command');
+			}
+		});
+		// This adds a complex command that can check whether the current state of the app allows execution of the command
+		this.addCommand({
+			id: 'open-modal-complex',
+			name: 'Open modal (complex)',
+			checkCallback: (checking: boolean) => {
+				// Conditions to check
+				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (markdownView) {
+					// If checking is true, we're simply "checking" if the command can be run.
+					// If checking is false, then we want to actually perform the operation.
+					if (!checking) {
+						new SampleModal(this.app).open();
+					}
+
+					// This command will only show up in Command Palette when the check function returns true
 					return true;
 				}
 				return false;
-			},
+			}
 		});
 
-		// Command: retry after a push failure
-		this.addCommand({
-			id: 'retry-publish',
-			name: 'Retry last publish',
-			callback: () => void this.retryPublish(),
+		// This adds a settings tab so the user can configure various aspects of the plugin
+		this.addSettingTab(new SampleSettingTab(this.app, this));
+
+		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
+		// Using this function will automatically remove the event listener when this plugin is disabled.
+		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
+			new Notice("Click");
 		});
 
-		this.addSettingTab(new KaraokeSettingTab(this.app, this));
+		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
+		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
 
-		// Startup: warn if vault is not a git repo
-		const repoRoot = this.getRepoRoot();
-		if (repoRoot) {
-			isGitRepo(repoRoot).then(hasGit => {
-				if (!hasGit) {
-					new Notice(
-						'karaoke-cms: This vault is not a git repository. ' +
-						'Run `npm create @karaoke-cms@latest` to set up your site.',
-						10000
-					);
-				}
-			});
-		} else {
-			new Notice('karaoke-cms: Only works with a local vault on desktop.', 8000);
-		}
 	}
 
-	onunload() {}
-
-	// ── Helpers ────────────────────────────────────────────────────────────────
-
-	private getRepoRoot(): string | null {
-		const adapter = this.app.vault.adapter;
-		// basePath is not in Obsidian's public TypeScript types but is stable on desktop
-		if (adapter instanceof FileSystemAdapter) {
-			return (adapter as unknown as { basePath: string }).basePath;
-		}
-		return null;
+	onunload() {
 	}
-
-	getActiveMarkdownFile(): TFile | null {
-		const file = this.app.workspace.getActiveFile();
-		return file instanceof TFile && file.extension === 'md' ? file : null;
-	}
-
-	// ── Status bar ─────────────────────────────────────────────────────────────
-
-	/**
-	 * Refresh the status bar text based on current push state.
-	 *
-	 * State machine:
-	 *   isPushing          → ⏳ Publishing...
-	 *   errorMessage set   → ⚠ Push failed: {reason}   (click to dismiss)
-	 *   no active note     → (empty)
-	 *   else               → async read frontmatter → ✓ Published | · Draft
-	 */
-	refreshStatusBar(): void {
-		if (this.isPushing) {
-			this.statusBarItem.setText('⏳ Publishing...');
-			return;
-		}
-
-		if (this.errorMessage) {
-			this.statusBarItem.setText(`⚠ Push failed: ${this.errorMessage}`);
-			this.statusBarItem.setAttribute('title', 'Click to dismiss');
-			return;
-		}
-
-		const file = this.getActiveMarkdownFile();
-		if (!file) {
-			this.statusBarItem.setText('');
-			return;
-		}
-
-		const snapshotPath = file.path;
-		this.app.vault.read(file).then(content => {
-			// Guard: active file may have changed during the async read
-			if (this.isPushing || this.errorMessage) return;
-			if (this.getActiveMarkdownFile()?.path !== snapshotPath) return;
-			this.statusBarItem.setText(readPublishField(content) ? '✓ Published' : '· Draft');
-			this.statusBarItem.setAttribute('title', '');
-		});
-	}
-
-	private onStatusBarClick(): void {
-		if (this.errorMessage) {
-			this.errorMessage = null;
-			this.refreshStatusBar();
-		}
-	}
-
-	// ── Publish toggle ─────────────────────────────────────────────────────────
-
-	async togglePublish(): Promise<void> {
-		if (this.isPushing) return;
-
-		const file = this.getActiveMarkdownFile();
-		if (!file) {
-			new Notice('karaoke-cms: Open a Markdown note to publish.');
-			return;
-		}
-
-		const repoRoot = this.getRepoRoot();
-		if (!repoRoot) {
-			new Notice('karaoke-cms: Only works with a local vault on desktop.');
-			return;
-		}
-
-		// Read, toggle, write
-		const content = await this.app.vault.read(file);
-		const { newContent, isNowPublished } = togglePublishFrontmatter(content);
-		await this.app.vault.modify(file, newContent);
-
-		// Build commit message from frontmatter title
-		const title = getTitleFromContent(newContent, file.basename);
-		const action = isNowPublished ? 'Published' : 'Unpublished';
-		const message = this.settings.commitTemplate
-			.replace('{title}', title)
-			.replace('{action}', action);
-
-		// Store for potential retry
-		this.lastPushFile = file.path;
-		this.lastPushMessage = message;
-		this.lastPushRepoRoot = repoRoot;
-
-		this.errorMessage = null;
-		this.isPushing = true;
-		this.refreshStatusBar();
-
-		try {
-			await commitAndPush(file.path, message, repoRoot, this.settings);
-			this.isPushing = false;
-			this.refreshStatusBar();
-			new Notice(`karaoke-cms: ${action}. Site is building.`);
-		} catch (err) {
-			this.isPushing = false;
-			this.errorMessage = err instanceof Error ? err.message : String(err);
-			this.refreshStatusBar();
-		}
-	}
-
-	// ── Retry ──────────────────────────────────────────────────────────────────
-
-	async retryPublish(): Promise<void> {
-		if (this.isPushing) return;
-		if (!this.lastPushFile || !this.lastPushMessage || !this.lastPushRepoRoot) {
-			new Notice('karaoke-cms: Nothing to retry.');
-			return;
-		}
-
-		this.errorMessage = null;
-		this.isPushing = true;
-		this.refreshStatusBar();
-
-		try {
-			await commitAndPush(
-				this.lastPushFile,
-				this.lastPushMessage,
-				this.lastPushRepoRoot,
-				this.settings
-			);
-			this.isPushing = false;
-			this.refreshStatusBar();
-			new Notice('karaoke-cms: Published successfully.');
-		} catch (err) {
-			this.isPushing = false;
-			this.errorMessage = err instanceof Error ? err.message : String(err);
-			this.refreshStatusBar();
-		}
-	}
-
-	// ── Settings ───────────────────────────────────────────────────────────────
 
 	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			(await this.loadData()) as Partial<KaraokeSettings>
-		);
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
 	}
 
 	async saveSettings() {
@@ -241,83 +82,18 @@ export default class KaraokePlugin extends Plugin {
 	}
 }
 
-// ── Pure frontmatter helpers (exported for unit tests) ─────────────────────────
-
-/**
- * Return true if the note has `publish: true` in its YAML frontmatter.
- */
-export function readPublishField(content: string): boolean {
-	if (!content.startsWith('---\n')) return false;
-	const closeIdx = content.indexOf('\n---', 4);
-	if (closeIdx === -1) return false;
-	const body = content.slice(4, closeIdx);
-	const match = body.match(/^publish:\s*(.+)$/m);
-	return match !== null && match[1]?.trim() === 'true';
-}
-
-/**
- * Toggle the `publish` field in YAML frontmatter.
- *
- * State machine:
- *   no frontmatter          → add block with publish: true
- *   frontmatter, no publish → add publish: true
- *   publish: false (or any) → publish: true
- *   publish: true           → publish: false
- */
-export function togglePublishFrontmatter(content: string): {
-	newContent: string;
-	isNowPublished: boolean;
-} {
-	// No frontmatter — prepend a minimal block
-	if (!content.startsWith('---\n')) {
-		return {
-			newContent: `---\npublish: true\n---\n\n${content}`,
-			isNowPublished: true,
-		};
+class SampleModal extends Modal {
+	constructor(app: App) {
+		super(app);
 	}
 
-	// Find the closing delimiter
-	const closeIdx = content.indexOf('\n---', 4);
-	if (closeIdx === -1) {
-		// Malformed frontmatter — treat as absent
-		return {
-			newContent: `---\npublish: true\n---\n\n${content}`,
-			isNowPublished: true,
-		};
+	onOpen() {
+		let {contentEl} = this;
+		contentEl.setText('Woah!');
 	}
 
-	const fmOpen = content.slice(0, 4); // '---\n'
-	const fmBody = content.slice(4, closeIdx); // body between delimiters
-	const rest = content.slice(closeIdx); // '\n---' + everything after
-
-	const publishRx = /^(publish:\s*)(.+)$/m;
-	const match = fmBody.match(publishRx);
-
-	if (!match) {
-		// No publish field — append it
-		return {
-			newContent: `${fmOpen}${fmBody}\npublish: true${rest}`,
-			isNowPublished: true,
-		};
+	onClose() {
+		const {contentEl} = this;
+		contentEl.empty();
 	}
-
-	const isCurrentlyPublished = match[2]?.trim() === 'true';
-	const newBody = fmBody.replace(publishRx, `$1${isCurrentlyPublished ? 'false' : 'true'}`);
-
-	return {
-		newContent: `${fmOpen}${newBody}${rest}`,
-		isNowPublished: !isCurrentlyPublished,
-	};
-}
-
-/**
- * Extract the title from YAML frontmatter, falling back to the file basename.
- */
-export function getTitleFromContent(content: string, basename: string): string {
-	if (!content.startsWith('---\n')) return basename;
-	const closeIdx = content.indexOf('\n---', 4);
-	if (closeIdx === -1) return basename;
-	const body = content.slice(4, closeIdx);
-	const match = body.match(/^title:\s*['"]?(.+?)['"]?\s*$/m);
-	return match ? (match[1]?.trim() ?? basename) : basename;
 }
